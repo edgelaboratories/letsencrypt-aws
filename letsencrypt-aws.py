@@ -70,32 +70,24 @@ class CertificateRequest(object):
         self.key_type = key_type
 
 
-class ELBCertificate(object):
+class LBCertificate(object):
     def __init__(self, elb_client, iam_client, elb_name, elb_port):
         self.elb_client = elb_client
-        self.iam_client = iam_client
         self.elb_name = elb_name
         self.elb_port = elb_port
+        self.elb_listener = None
+
+        self.iam_client = iam_client
+
+    def get_certificate_id(self):
+        raise NotImplementedError()
+
+    def set_certificate_id(self, certificate_id):
+        raise NotImplementedError()
 
     def get_current_certificate(self):
-        response = self.elb_client.describe_load_balancers(
-            LoadBalancerNames=[self.elb_name]
-        )
-        [description] = response["LoadBalancerDescriptions"]
-        [elb_listener] = [
-            listener["Listener"]
-            for listener in description["ListenerDescriptions"]
-            if listener["Listener"]["LoadBalancerPort"] == self.elb_port
-        ]
-
-        if "SSLCertificateId" not in elb_listener:
-            raise ValueError(
-                "A certificate must already be configured for the ELB"
-            )
-
-        return _get_iam_certificate(
-            self.iam_client, elb_listener["SSLCertificateId"]
-        )
+        certificate_id = self.get_certificate_id()
+        return _get_iam_certificate(self.iam_client, certificate_id)
 
     def update_certificate(self, logger, hosts, private_key, pem_certificate,
                            pem_certificate_chain):
@@ -124,10 +116,59 @@ class ELBCertificate(object):
         # fail without this.
         time.sleep(15)
         logger.emit("updating-elb.set-elb-certificate", elb_name=self.elb_name)
+        self.set_certificate_id(new_cert_arn)
+
+
+class ELBCertificate(LBCertificate):
+    def get_certificate_id(self):
+        response = self.elb_client.describe_load_balancers(
+            LoadBalancerNames=[self.elb_name]
+        )
+        [description] = response["LoadBalancerDescriptions"]
+        self.elb_listener = [
+            listener["Listener"]
+            for listener in description["ListenerDescriptions"]
+            if listener["Listener"]["LoadBalancerPort"] == self.elb_port
+        ][0]
+
+        if "SSLCertificateId" not in self.elb_listener:
+            raise ValueError(
+                "A certificate must already be configured for the ELB"
+            )
+        return self.elb_listener["SSLCertificateId"]
+
+    def set_certificate_id(self, certificate_id):
         self.elb_client.set_load_balancer_listener_ssl_certificate(
             LoadBalancerName=self.elb_name,
-            SSLCertificateId=new_cert_arn,
+            SSLCertificateId=certificate_id,
             LoadBalancerPort=self.elb_port,
+        )
+
+
+class ELBV2Certificate(LBCertificate):
+    def get_certificate_id(self):
+        response = self.elb_client.describe_load_balancers(
+            Names=[self.elb_name]
+        )
+        elb_arn = response["LoadBalancers"][0]["LoadBalancerArn"]
+        self.elb_listener = self.elb_client.describe_listeners(
+            LoadBalancerArn=elb_arn,
+        )["Listeners"][0]
+
+        certificates = self.elb_listener.get("Certificates")
+        if not certificates:
+            raise ValueError(
+                "A certificate must already be configured for the ELB"
+            )
+
+        return certificates[0]["CertificateArn"]
+
+    def set_certificate_id(self, certificate_id):
+        self.elb_client.modify_listener(
+            ListenerArn=self.elb_listener["ListenerArn"],
+            Certificates=[{
+                "CertificateArn": certificate_id,
+            }]
         )
 
 
@@ -248,7 +289,7 @@ def find_dns_challenge(authz):
 
 def generate_certificate_name(hosts, cert):
     return "{serial}-{expiration}-{hosts}".format(
-        serial=cert.serial,
+        serial=cert.serial_number,
         expiration=cert.not_valid_after.date(),
         hosts="-".join(h.replace(".", "_") for h in hosts),
     )[:128]
@@ -492,6 +533,7 @@ def update_certificates(persistent=False, force_issue=False):
     session = boto3.Session()
     s3_client = session.client("s3")
     elb_client = session.client("elb")
+    elbv2_client = session.client("elbv2")
     route53_client = session.client("route53")
     iam_client = session.client("iam")
 
@@ -512,6 +554,12 @@ def update_certificates(persistent=False, force_issue=False):
                 elb_client, iam_client,
                 domain["elb"]["name"], int(domain["elb"].get("port", 443))
             )
+        elif "elbv2" in domain:
+            cert_location = ELBV2Certificate(
+                elbv2_client, iam_client,
+                domain["elbv2"]["name"], int(domain["elbv2"].get("port", 443))
+            )
+
         else:
             raise ValueError(
                 "Unknown certificate location: {!r}".format(domain)
